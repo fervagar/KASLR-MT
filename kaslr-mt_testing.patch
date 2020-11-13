@@ -1,0 +1,324 @@
+diff --git a/arch/x86/Kconfig b/arch/x86/Kconfig
+index 64d5a3327030..cb47ae6d42b6 100644
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -2149,6 +2149,23 @@ config RANDOMIZE_BASE
+ 
+ 	  If unsure, say Y.
+ 
++config KASLR_MT
++        bool "Kernel Address Space Layout Randomization Multi-Tenant"
++        depends on RANDOMIZE_BASE && X86_64
++        default y
++        help
++          This option allows the kernel memory layout to be deterministically produced from a key
++          passed through the command line argument "kaslr_mt=". This feature is intended to be
++          beneficial in multi-tenant systems where several tenants are owners of one or more groups
++          of virtual machines, and all of them share the resources of a single physical machine by
++          the use of virtualization technologies. This option allows guest kernels to randomize the
++          addresses of their memory regions consistently among multiple VMs belonging to the same
++          tenant. Thus, it is compatible with memory deduplication and increases the benefits of
++          memory sharing in the host machine while keeping the security provided by KASLR in
++          the guest kernels.
++
++          If unsure, say N.
++
+ # Relocation on x86 needs some additional build support
+ config X86_NEED_RELOCS
+ 	def_bool y
+diff --git a/arch/x86/boot/compressed/kaslr.c b/arch/x86/boot/compressed/kaslr.c
+index 9ed9709d9947..ecef84d70c5e 100644
+--- a/arch/x86/boot/compressed/kaslr.c
++++ b/arch/x86/boot/compressed/kaslr.c
+@@ -11,6 +11,8 @@
+  *
+  */
+ 
++#define KASLR_COMPRESSED_BOOT
++
+ /*
+  * isspace() in linux/ctype.h is expected by next_args() to filter
+  * out "space/lf/tab". While boot/ctype.h conflicts with linux/ctype.h,
+@@ -49,6 +51,14 @@ unsigned int pgdir_shift __ro_after_init = 39;
+ unsigned int ptrs_per_p4d __ro_after_init = 1;
+ #endif
+ 
++#ifdef CONFIG_KASLR_MT
++#include <../../lib/xxhash.c>
++#include <asm/kaslr.h>
++static bool kaslr_mt__enabled;
++static bool kaslr_mt__addr_set[KMT_ADDRESSES];
++static unsigned long kaslr_mt__prn[KMT_ADDRESSES];
++#endif
++
+ extern unsigned long get_cmd_line_ptr(void);
+ 
+ /* Used by PAGE_KERN* macros: */
+@@ -84,7 +94,6 @@ static unsigned long get_boot_seed(void)
+ 	return hash;
+ }
+ 
+-#define KASLR_COMPRESSED_BOOT
+ #include "../../lib/kaslr.c"
+ 
+ struct mem_vector {
+@@ -557,7 +566,11 @@ static unsigned long slots_fetch_random(void)
+ 	if (slot_max == 0)
+ 		return 0;
+ 
+-	slot = kaslr_get_random_long("Physical") % slot_max;
++        if (IS_ENABLED(CONFIG_KASLR_MT)
++            && kaslr_mt__enabled && kaslr_mt__addr_set[KMT_IDX_KPHYS_ADDR])
++                slot = kaslr_mt__prn[KMT_IDX_KPHYS_ADDR] % slot_max;
++        else
++                slot = kaslr_get_random_long("Physical") % slot_max;
+ 
+ 	for (i = 0; i < slot_area_index; i++) {
+ 		if (slot >= slot_areas[i].num) {
+@@ -791,11 +804,53 @@ static unsigned long find_random_virt_addr(unsigned long minimum,
+ 	slots = (KERNEL_IMAGE_SIZE - minimum - image_size) /
+ 		 CONFIG_PHYSICAL_ALIGN + 1;
+ 
+-	random_addr = kaslr_get_random_long("Virtual") % slots;
++        if (IS_ENABLED(CONFIG_KASLR_MT)
++            && kaslr_mt__enabled && kaslr_mt__addr_set[KMT_IDX_KVIRT_ADDR])
++                random_addr = kaslr_mt__prn[KMT_IDX_KVIRT_ADDR] % slots;
++        else
++                random_addr = kaslr_get_random_long("Virtual") % slots;
+ 
+ 	return random_addr * CONFIG_PHYSICAL_ALIGN + minimum;
+ }
+ 
++#ifdef CONFIG_KASLR_MT
++void init_kaslr_mt_state()
++{
++        char kaslr_mt__key[KASLR_MT__KEY_LEN + 1], *ptr;
++        unsigned long seed;
++        long len;
++        int i;
++
++        kaslr_mt__enabled = false;
++        len = cmdline_find_option("kaslr_mt", kaslr_mt__key, sizeof(kaslr_mt__key));
++        if (len <= 0) {
++                debug_putstr("[DEBUG] KASLR_MT disabled.\n");
++                return;
++        }
++
++        kaslr_mt__enabled = true;
++        ptr = kaslr_mt__key;
++        seed = simple_strtoull(ptr, &ptr, 0);
++
++        for (i = 0; i < KMT_ADDRESSES; i++) {
++                kaslr_mt__addr_set[i] = ('1' == kaslr_mt__key[len - 1 - i]);
++        }
++        // Avoid polluting the digest
++        kaslr_mt__key[len - KMT_TOTAL_ADDRESSES] = '\0';
++        len -= KMT_TOTAL_ADDRESSES;
++
++        // Address producer //
++        for (i = 0; i < KMT_ADDRESSES; i++, seed++) {
++                if (!kaslr_mt__addr_set[i]) continue;
++                // Produce the pseudo-random number for this region
++                // NOTE: xxhash for this PoC (neat code, just one call)
++                kaslr_mt__prn[i] = (unsigned long) xxh64(kaslr_mt__key, len, seed);
++        }
++
++        return;
++}
++#endif
++
+ /*
+  * Since this function examines addresses much more numerically,
+  * it takes the input and output pointers as 'unsigned long'.
+diff --git a/arch/x86/boot/compressed/misc.c b/arch/x86/boot/compressed/misc.c
+index 8dd1d5ccae58..d2162074cfff 100644
+--- a/arch/x86/boot/compressed/misc.c
++++ b/arch/x86/boot/compressed/misc.c
+@@ -382,6 +382,10 @@ asmlinkage __visible void *extract_kernel(void *rmode, memptr heap,
+ 	debug_putaddr(trampoline_32bit);
+ #endif
+ 
++        /* Initialise KASLR_MT state */
++        if (IS_ENABLED(CONFIG_X86_64) && IS_ENABLED(CONFIG_KASLR_MT))
++                init_kaslr_mt_state();
++
+ 	/*
+ 	 * The memory hole needed for the kernel is the larger of either
+ 	 * the entire decompressed kernel plus relocation table, or the
+diff --git a/arch/x86/include/asm/kaslr.h b/arch/x86/include/asm/kaslr.h
+index db7ba2feb947..aaaef70a9ae5 100644
+--- a/arch/x86/include/asm/kaslr.h
++++ b/arch/x86/include/asm/kaslr.h
+@@ -6,8 +6,31 @@ unsigned long kaslr_get_random_long(const char *purpose);
+ 
+ #ifdef CONFIG_RANDOMIZE_MEMORY
+ void kernel_randomize_memory(void);
++
++#ifdef CONFIG_KASLR_MT
++#define KASLR_MT__KEY_LEN               (30)
++#define KMT_TOTAL_ADDRESSES             (2 + 4)
++#ifdef KASLR_COMPRESSED_BOOT
++// Kernel decompressor / Bootloader
++#define KMT_IDX_KPHYS_ADDR              0
++#define KMT_IDX_KVIRT_ADDR              1
++#define KMT_ADDRESSES                   2
++#else
++// Linux Kernel
++#define KMT_OFFSET_IDX                  2 // consumed by bootloader
++#define KMT_IDX_PHYSMAP_ADDR            0
++#define KMT_IDX_VMALLOC_ADDR            1
++#define KMT_IDX_VMEMMAP_ADDR            2
++#define KMT_IDX_MODULES_ADDR            3
++#define KMT_ADDRESSES                   4
++#endif
++void init_kaslr_mt_state(void);
++#endif /* CONFIG_KASLR_MT */
+ #else
+ static inline void kernel_randomize_memory(void) { }
++#ifdef CONFIG_KASLR_MT
++static inline void init_kaslr_mt_state(void) {}
++#endif /* CONFIG_KASLR_MT */
+ #endif /* CONFIG_RANDOMIZE_MEMORY */
+ 
+ #endif
+diff --git a/arch/x86/kernel/module.c b/arch/x86/kernel/module.c
+index b052e883dd8c..5cf0f67b97a7 100644
+--- a/arch/x86/kernel/module.c
++++ b/arch/x86/kernel/module.c
+@@ -54,8 +54,16 @@ static unsigned long module_load_offset;
+ /* Mutex protects the module_load_offset. */
+ static DEFINE_MUTEX(module_kaslr_mutex);
+ 
++#ifdef CONFIG_KASLR_MT
++#include <asm/kaslr.h>
++extern bool kaslr_mt__enabled;
++extern bool kaslr_mt__addr_set[KMT_ADDRESSES];
++extern unsigned long kaslr_mt__prn[KMT_ADDRESSES];
++#endif /* CONFIG_KASLR_MT */
++
+ static unsigned long int get_module_load_offset(void)
+ {
++        unsigned long rand;
+ 	if (kaslr_enabled()) {
+ 		mutex_lock(&module_kaslr_mutex);
+ 		/*
+@@ -63,9 +71,16 @@ static unsigned long int get_module_load_offset(void)
+ 		 * code is called. Once calculated it stays the same until
+ 		 * reboot.
+ 		 */
+-		if (module_load_offset == 0)
++		if (module_load_offset == 0) {
++                        if (IS_ENABLED(CONFIG_KASLR_MT)
++                            && kaslr_mt__enabled
++                            && kaslr_mt__addr_set[KMT_IDX_MODULES_ADDR])
++                                rand = kaslr_mt__prn[KMT_IDX_MODULES_ADDR];
++                        else
++                                rand = get_random_int();
+ 			module_load_offset =
+-				(get_random_int() % 1024 + 1) * PAGE_SIZE;
++				(rand % 1024 + 1) * PAGE_SIZE;
++                }
+ 		mutex_unlock(&module_kaslr_mutex);
+ 	}
+ 	return module_load_offset;
+diff --git a/arch/x86/kernel/setup.c b/arch/x86/kernel/setup.c
+index 3d872a527cd9..461cd6ef52f5 100644
+--- a/arch/x86/kernel/setup.c
++++ b/arch/x86/kernel/setup.c
+@@ -837,6 +837,13 @@ void __init setup_arch(char **cmdline_p)
+ 	 * RAM in e820. All other memory is free game.
+ 	 */
+ 
++        /*
++         * Initialise KASLR_MT state and clean boot_command_line to avoid leaks.
++         * This should be before printing cmdline.
++         */
++        if (IS_ENABLED(CONFIG_X86_64) && IS_ENABLED(CONFIG_KASLR_MT))
++                init_kaslr_mt_state();
++
+ #ifdef CONFIG_X86_32
+ 	memcpy(&boot_cpu_data, &new_cpu_data, sizeof(new_cpu_data));
+ 
+diff --git a/arch/x86/mm/kaslr.c b/arch/x86/mm/kaslr.c
+index 3f452ffed7e9..8a04bf6c71f5 100644
+--- a/arch/x86/mm/kaslr.c
++++ b/arch/x86/mm/kaslr.c
+@@ -55,6 +55,14 @@ static __initdata struct kaslr_memory_region {
+ 	{ &vmemmap_base, 1 },
+ };
+ 
++#ifdef CONFIG_KASLR_MT
++#include <asm/cmdline.h>
++#include <../../lib/xxhash.c>
++bool kaslr_mt__enabled;
++bool kaslr_mt__addr_set[KMT_ADDRESSES];
++unsigned long kaslr_mt__prn[KMT_ADDRESSES];
++#endif
++
+ /* Get size in bytes used by the memory region */
+ static inline unsigned long get_padding(struct kaslr_memory_region *region)
+ {
+@@ -70,6 +78,49 @@ static inline bool kaslr_memory_enabled(void)
+ 	return kaslr_enabled() && !IS_ENABLED(CONFIG_KASAN);
+ }
+ 
++#ifdef CONFIG_KASLR_MT
++void __init init_kaslr_mt_state(void)
++{
++        char kaslr_mt__key[KASLR_MT__KEY_LEN + 1], *ptr;
++        unsigned long seed;
++        long len;
++        int i;
++
++        kaslr_mt__enabled = false;
++        len = cmdline_find_option(boot_command_line, "kaslr_mt", kaslr_mt__key, sizeof(kaslr_mt__key));
++        if (len <= 0) {
++                printk(KERN_DEBUG "KASLR_MT disabled.\n");
++                return;
++        }
++
++        kaslr_mt__enabled = true;
++
++        ptr = kaslr_mt__key + len - KMT_TOTAL_ADDRESSES;
++        printk(KERN_DEBUG "KASLR_MT cmdline bitmap -> %s\n", ptr);
++
++        ptr = kaslr_mt__key;
++        seed = simple_strtoull(ptr, &ptr, 0);
++
++        for (i = 0; i < KMT_ADDRESSES; i++) {
++                kaslr_mt__addr_set[i] = ('1' == kaslr_mt__key[len - 1 - i - KMT_OFFSET_IDX]);
++        }
++        // Avoid polluting the digest
++        kaslr_mt__key[len - KMT_TOTAL_ADDRESSES] = '\0';
++        len -= KMT_TOTAL_ADDRESSES;
++
++        // Address producer //
++        for (i = 0; i < KMT_ADDRESSES; i++, seed++) {
++                if (!kaslr_mt__addr_set[i]) continue;
++                // Produce the pseudo-random number for this region
++                // NOTE: xxhash for this PoC (neat code, just one call)
++                kaslr_mt__prn[i] = (unsigned long) xxh64(kaslr_mt__key, len, seed);
++        }
++
++        // TODO: Clear the cmdline option to avoid leaking the key
++        return;
++}
++#endif
++
+ /* Initialize base and padding for each memory region randomized with KASLR */
+ void __init kernel_randomize_memory(void)
+ {
+@@ -124,7 +175,12 @@ void __init kernel_randomize_memory(void)
+ 		 * available.
+ 		 */
+ 		entropy = remain_entropy / (ARRAY_SIZE(kaslr_regions) - i);
+-		prandom_bytes_state(&rand_state, &rand, sizeof(rand));
++                if (IS_ENABLED(CONFIG_KASLR_MT)
++                    && kaslr_mt__enabled && kaslr_mt__addr_set[i])
++                        rand = kaslr_mt__prn[i];
++                else
++                        prandom_bytes_state(&rand_state, &rand, sizeof(rand));
++
+ 		if (pgtable_l5_enabled())
+ 			entropy = (rand % (entropy + 1)) & P4D_MASK;
+ 		else
